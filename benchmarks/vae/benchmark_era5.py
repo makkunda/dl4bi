@@ -67,6 +67,7 @@ from orbax.checkpoint import PyTreeCheckpointer
 from dl4bi_sps.utils import build_grid
 
 import wandb
+from dl4bi_sps.kernels import matern_3_2
 from dl4bi.attention import BiasedScanAttention, MultiHeadAttention
 from dl4bi.bias import Bias
 from dl4bi.core.data import Batch
@@ -115,6 +116,12 @@ HMC_CHAINS   = 2
 FM_K_STEPS   = [1, 3, 5, 7]
 N_BLOCKS     = 4
 
+# Weakly informative Matérn-3/2 prior for DeepRV (in normalised coordinate units)
+# Covers very rough (ℓ=0.05, ~0.1°) to very smooth (ℓ=3, longer than domain)
+LS_MIN_NORM  = 0.05
+LS_MAX_NORM  = 3.0
+GP_JITTER    = 5e-3   # larger than usual — K becomes near rank-1 at large ℓ
+
 TRAIN_REGION = "central_europe"
 VALID_REGION = "northern_europe"
 TEST_REGION  = "western_europe"
@@ -153,6 +160,17 @@ class SpatialBatch(Batch):
     t_test:   Optional[Array] = None     # [B, L,     1]  constant zero
     f_test:   Optional[Array] = None     # [B, L,     1]
     mask_test: Optional[Array] = None    # [B, L]
+
+
+jax.tree_util.register_pytree_node(
+    SpatialBatch,
+    lambda b: (
+        (b.x_ctx, b.s_ctx, b.t_ctx, b.f_ctx, b.mask_ctx,
+         b.x_test, b.s_test, b.t_test, b.f_test, b.mask_test),
+        None,
+    ),
+    lambda _, children: SpatialBatch(*children),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -290,22 +308,73 @@ def gen_train_dataloader(patches: Array, s: Array, batch_size: int = BATCH_SIZE)
     return dataloader
 
 
+def gen_deeprv_dataloader(s: Array, batch_size: int = BATCH_SIZE):
+    """Training dataloader for DeepRV: GP draws from Matérn-3/2 with
+    log-uniform lengthscale prior.  z and f are coupled via the Cholesky
+    factor so DeepRV can learn a meaningful z→f map.
+    log(ℓ_norm) is passed as the conditional so the decoder adapts to ℓ.
+    """
+    L = s.shape[0]
+
+    @jit
+    def _sample(rng_ls, rng_z):
+        log_ls = dist.Uniform(jnp.log(LS_MIN_NORM), jnp.log(LS_MAX_NORM)).sample(rng_ls)
+        ls = jnp.exp(log_ls)
+        K  = matern_3_2(s, s, 1.0, ls) + GP_JITTER * jnp.eye(L)
+        Lc = jnp.linalg.cholesky(K)
+        z  = dist.Normal().sample(rng_z, sample_shape=(batch_size, L))
+        f  = jnp.einsum("ij,bj->bi", Lc, z)          # [B, L] — z and f are coupled
+        return f, z, log_ls
+
+    def dataloader(rng):
+        while True:
+            rng, r1, r2 = random.split(rng, 3)
+            f, z, log_ls = _sample(r1, r2)
+            yield {
+                "s": s,
+                "f": f,
+                "z": z,
+                "conditionals": jnp.atleast_1d(log_ls),   # log(ℓ_norm) — 1-dim
+            }
+
+    return dataloader
+
+
 # ---------------------------------------------------------------------------
-# Inference model — Gaussian inpainting with surrogate prior
+# Inference models — Gaussian inpainting with surrogate prior
 # ---------------------------------------------------------------------------
 
-def build_surrogate_inpainting_model(s: Array) -> Callable:
-    """z ~ N(0,I),  f = decoder(z),  y_obs ~ N(f[obs], sigma)."""
+def build_deeprv_inpainting_model(s: Array) -> Callable:
+    """HMC model for DeepRV trained on the weakly informative GP prior.
+    Samples z AND log_ls jointly from the same prior used at training time.
+    """
+    surrogate_kwargs = {"s": s}
+
+    def inpaint(surrogate_decoder=None, obs_mask=None, y=None):
+        log_ls = numpyro.sample(
+            "log_ls",
+            dist.Uniform(jnp.log(LS_MIN_NORM), jnp.log(LS_MAX_NORM)),
+        )
+        z = numpyro.sample("z", dist.Normal(), sample_shape=(1, s.shape[0]))
+        f = surrogate_decoder(
+            z, jnp.atleast_1d(log_ls), **surrogate_kwargs
+        ).squeeze()
+        numpyro.deterministic("f", f)
+        with numpyro.handlers.mask(mask=obs_mask):
+            numpyro.sample("obs", dist.Normal(f, OBS_NOISE), obs=y)
+
+    return inpaint
+
+
+def build_fm_inpainting_model(s: Array) -> Callable:
+    """HMC model for FM-DeepRV: samples only z ~ N(0,I), no ℓ conditioning."""
     surrogate_kwargs = {"s": s}
 
     def inpaint(surrogate_decoder=None, obs_mask=None, y=None):
         z = numpyro.sample("z", dist.Normal(), sample_shape=(1, s.shape[0]))
-        if surrogate_decoder is None:
-            f = z[0]
-        else:
-            f = surrogate_decoder(
-                z, jnp.array([0.0]), **surrogate_kwargs
-            ).squeeze()
+        f = surrogate_decoder(
+            z, jnp.array([0.0]), **surrogate_kwargs
+        ).squeeze()
         numpyro.deterministic("f", f)
         with numpyro.handlers.mask(mask=obs_mask):
             numpyro.sample("obs", dist.Normal(f, OBS_NOISE), obs=y)
@@ -415,6 +484,28 @@ def mean_rhat_z(samples_by_chain: dict) -> float:
     )
     rhat = az.rhat(idata, var_names=["z"])
     return float(rhat["z"].values.mean())
+
+
+def ess_log_ls(mcmc) -> float:
+    """ESS for log_ls — only defined for DeepRV (GP prior)."""
+    try:
+        ess = az.ess(mcmc, method="mean", var_names=["log_ls"])
+        return float(ess["log_ls"].values)
+    except Exception:
+        return float("nan")
+
+
+def rhat_log_ls(samples_by_chain: dict) -> float:
+    if "log_ls" not in next(iter(samples_by_chain.values())):
+        return float("nan")
+    try:
+        idata = az.convert_to_inference_data(
+            {k: np.array(v) for k, v in samples_by_chain.items()}
+        )
+        rhat = az.rhat(idata, var_names=["log_ls"])
+        return float(rhat["log_ls"].values)
+    except Exception:
+        return float("nan")
 
 
 def patch_metrics(true_f, post_f_mean, post_f_samples, obs_mask, hdi_prob=0.9):
@@ -793,14 +884,30 @@ SCALAR_KEYS = {
     "model_name", "patch_idx", "n_ctx", "infer_time",
     "RMSE (all)", "RMSE (ctx)", "RMSE (target)",
     "MAE (target)", "CRPS (target)", "Coverage 90%", "NLL (target)",
-    "mean ESS z", "mean r_hat z",
+    "mean ESS z", "mean r_hat z", "ESS log_ls", "r_hat log_ls",
 }
 
 
-def main(seed: int = 42):
+def main(seed: int = 42, use_wandb: bool = False):
     rng = random.key(seed)
     save_dir = Path("results/era5_benchmark/").resolve()
     save_dir.mkdir(parents=True, exist_ok=True)
+
+    wandb.init(
+        project="era5-benchmark",
+        name=f"era5_seed{seed}",
+        config={
+            "seed": seed, "patch_size": PATCH_SIZE,
+            "n_train": N_TRAIN, "n_test": N_TEST,
+            "n_ctx_min": N_CTX_MIN, "n_ctx_max": N_CTX_MAX,
+            "obs_noise": OBS_NOISE, "train_steps": TRAIN_STEPS,
+            "hmc_warmup": HMC_WARMUP, "hmc_samples": HMC_SAMPLES,
+            "hmc_chains": HMC_CHAINS, "fm_k_steps": FM_K_STEPS,
+            "ls_min_norm": LS_MIN_NORM, "ls_max_norm": LS_MAX_NORM,
+        },
+        mode="online" if use_wandb else "disabled",
+        reinit=True,
+    )
 
     # ------------------------------------------------------------------
     # Load ERA5 data
@@ -845,11 +952,15 @@ def main(seed: int = 42):
     # ------------------------------------------------------------------
     # Train surrogates
     # ------------------------------------------------------------------
+    # DeepRV: GP draws with log-uniform ℓ (z and f coupled via Cholesky)
+    # FM-DeepRV: real ERA5 patches (learns data distribution unconditionally)
     train_configs = {
         "DeepRV + gMLP": (
             gMLPDeepRV(num_blks=N_BLOCKS),
             deep_rv_train_step,
             deep_rv_valid_step,
+            gen_deeprv_dataloader(s),                          # GP prior
+            gen_deeprv_dataloader(s),
         ),
         "FM-DeepRV": (
             FlowMatchingDeepRV(
@@ -857,11 +968,13 @@ def main(seed: int = 42):
             ),
             flow_matching_train_step,
             flow_matching_valid_step,
+            gen_train_dataloader(jnp.array(train_patches), s), # ERA5 data
+            gen_train_dataloader(jnp.array(valid_patches), s),
         ),
     }
 
     trained_states = {}
-    for model_name, (nn_model, train_step, valid_step) in train_configs.items():
+    for model_name, (nn_model, train_step, valid_step, train_loader, valid_loader) in train_configs.items():
         model_dir = (
             save_dir / model_name.replace(" ", "_").replace("+", "plus")
         ).resolve()
@@ -880,12 +993,6 @@ def main(seed: int = 42):
         else:
             print(f"\n=== Training {model_name} ===")
             rng, rng_t, rng_v = random.split(rng, 3)
-            train_loader = gen_train_dataloader(jnp.array(train_patches), s)
-            valid_loader = gen_train_dataloader(jnp.array(valid_patches), s)
-            wandb.init(
-                config={"model_name": model_name, "dataset": "era5", "seed": seed},
-                mode="disabled", reinit=True,
-            )
             train_time, eval_mse, state, _, _, _ = surrogate_model_train(
                 rng_t, rng_v, train_loader, train_step, valid_step,
                 nn_model, model_dir, optimizer,
@@ -916,10 +1023,6 @@ def main(seed: int = 42):
         rng, rng_bt, rng_bv = random.split(rng, 3)
         bsa_train_loader = gen_bsa_dataloader(jnp.array(train_patches), jnp.array(train_elev), s)
         bsa_valid_loader = gen_bsa_dataloader(jnp.array(valid_patches), jnp.array(valid_elev), s)
-        wandb.init(
-            config={"model_name": "BSA-TNP", "dataset": "era5", "seed": seed},
-            mode="disabled", reinit=True,
-        )
         bsa_train_time, bsa_nll, bsa_state = bsa_model_train(
             rng_bt, rng_bv, bsa_train_loader, bsa_valid_loader,
             bsa_model, bsa_dir, bsa_optimizer,
@@ -933,15 +1036,22 @@ def main(seed: int = 42):
     state_fm, fm_base_model = trained_states["FM-DeepRV"]
     fm_vf = fm_base_model.vf
 
+    # Each entry: (decoder, hmc_model)
+    # DeepRV uses a GP-prior HMC model that also samples log_ls
+    # FM-DeepRV uses an unconditional HMC model
+    deeprv_inpaint = build_deeprv_inpainting_model(s)
+    fm_inpaint     = build_fm_inpainting_model(s)
+
     surrogate_decoders = {
-        "DeepRV + gMLP": generate_surrogate_decoder(state_drv, drv_model),
+        "DeepRV + gMLP": (generate_surrogate_decoder(state_drv, drv_model), deeprv_inpaint),
     }
     for k in FM_K_STEPS:
         fm_k = FlowMatchingDeepRV(vf=fm_vf, n_steps=k)
-        surrogate_decoders[f"FM-DeepRV (K={k})"] = generate_surrogate_decoder(state_fm, fm_k)
+        surrogate_decoders[f"FM-DeepRV (K={k})"] = (
+            generate_surrogate_decoder(state_fm, fm_k), fm_inpaint
+        )
 
     eval_model_names = ["BSA-TNP", "SVGP"] + list(surrogate_decoders.keys())
-    inpaint_model = build_surrogate_inpainting_model(s)
 
     # ------------------------------------------------------------------
     # HMC inpainting on N_TEST test patches
@@ -1020,7 +1130,7 @@ def main(seed: int = 42):
         })
         img_recons.append(jnp.array(svgp_mu))
 
-        for model_name, decoder in surrogate_decoders.items():
+        for model_name, (decoder, hmc_model) in surrogate_decoders.items():
             safe_key = (
                 f"patch{patch_i}_{model_name}"
                 .replace(" ", "_").replace("=", "").replace("(", "").replace(")", "")
@@ -1035,7 +1145,7 @@ def main(seed: int = 42):
                 print(f"\n=== {model_name} | test patch {patch_i+1}/{N_TEST} ===")
                 rng, rng_i = random.split(rng)
                 samples, mcmc, post, infer_time = run_hmc_inpaint(
-                    rng_i, inpaint_model, y_obs, obs_mask, decoder
+                    rng_i, hmc_model, y_obs, obs_mask, decoder
                 )
                 f_samples = np.array(post["f"])          # [S, L]
                 f_mean    = f_samples.mean(axis=0)       # [L]
@@ -1062,13 +1172,18 @@ def main(seed: int = 42):
                     "NLL (target)": nll_target,
                     "mean ESS z": mean_ess_z(mcmc),
                     "mean r_hat z": mean_rhat_z(sbc),
+                    "ESS log_ls": ess_log_ls(mcmc),
+                    "r_hat log_ls": rhat_log_ls(sbc),
                     "f_mean": np.array(f_mean),
                     "samples_by_chain": sbc,
                 }
                 with open(cache_path, "wb") as fh:
                     pickle.dump(res, fh)
 
-            results.append({k: res.get(k, float("nan")) for k in SCALAR_KEYS})
+            row = {k: res.get(k, float("nan")) for k in SCALAR_KEYS}
+            results.append(row)
+            wandb.log({f"{model_name}/{k}": v for k, v in row.items()
+                       if isinstance(v, float) and k not in {"patch_idx", "n_ctx"}})
             img_recons.append(jnp.array(res["f_mean"]))
 
         vis_recons.append(img_recons)
@@ -1082,13 +1197,20 @@ def main(seed: int = 42):
         c for c in ["RMSE (target)", "MAE (target)", "CRPS (target)",
                     "Coverage 90%", "NLL (target)",
                     "RMSE (ctx)", "RMSE (all)",
-                    "n_ctx", "mean ESS z", "mean r_hat z", "infer_time"]
+                    "n_ctx", "mean ESS z", "mean r_hat z",
+                    "ESS log_ls", "r_hat log_ls", "infer_time"]
         if c in df.columns
     ]
     summary = df.groupby("model_name")[summary_cols].mean()
     print("\n=== Summary ===")
     print(summary.to_string())
     summary.to_csv(save_dir / "summary.csv")
+
+    # Log summary metrics and full results table to wandb
+    for model_name, row in summary.iterrows():
+        wandb.log({f"summary/{model_name}/{col}": val
+                   for col, val in row.items() if not np.isnan(val)})
+    wandb.log({"results_table": wandb.Table(dataframe=df[list(SCALAR_KEYS)])})
 
     n_vis = min(5, N_TEST)
     plot_reconstructions(
@@ -1104,4 +1226,9 @@ def main(seed: int = 42):
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
+    args = parser.parse_args()
+    main(seed=args.seed, use_wandb=args.wandb)
