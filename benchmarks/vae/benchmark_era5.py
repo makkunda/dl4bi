@@ -140,7 +140,7 @@ SVGP_JITTER       = 1e-4
 # Batch container for BSA-TNP (spatial-only, no fixed effects)
 # ---------------------------------------------------------------------------
 
-@dataclass
+@dataclass(frozen=True)
 class SpatialBatch(Batch):
     """Minimal ctx/test batch consumed by likelihood_train/valid_step."""
     x_ctx:    Optional[Array] = None
