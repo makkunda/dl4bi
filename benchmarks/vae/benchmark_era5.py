@@ -603,7 +603,7 @@ def _matern32(x_a: Array, x_b: Array, amp: Array, ls: Array) -> Array:
 
 def _svgp_model(x, y, z_init, jitter=SVGP_JITTER):
     amp   = numpyro.param("amp",   jnp.array(SVGP_INIT_AMP),          constraint=constraints.positive)
-    ls    = numpyro.param("ls",    jnp.ones(2) * SVGP_INIT_LS,        constraint=constraints.positive)
+    ls    = numpyro.param("ls",    jnp.ones(3) * SVGP_INIT_LS,        constraint=constraints.positive)
     noise = numpyro.param("noise", jnp.array(SVGP_INIT_NOISE),        constraint=constraints.positive)
     z = z_init
     k_zz  = _matern32(z, z, amp, ls) + jitter * jnp.eye(z.shape[0])
