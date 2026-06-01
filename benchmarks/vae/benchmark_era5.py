@@ -732,12 +732,13 @@ def make_bsa_tnp() -> BSATNP:
 
 
 def gen_bsa_dataloader(
-    patches: Array, elev_patches: Array, s: Array, batch_size: int = BSA_BATCH_SIZE
+    patches: Array, elev_patches: Array, s: Array,
+    batch_size: int = BSA_BATCH_SIZE, use_elev: bool = True,
 ):
     """Dataloader for BSA-TNP: samples random ctx/test splits per batch.
 
-    elevation is passed as x (fixed effects) so BSA-TNP can use it as a
-    covariate in addition to the spatial attention bias over s.
+    If use_elev=False, x is set to zeros so the model receives no elevation
+    signal — useful as a controlled ablation baseline.
     """
     N, L = patches.shape
 
@@ -746,7 +747,7 @@ def gen_bsa_dataloader(
             rng, rng_idx, rng_ctx, rng_perm = random.split(rng, 4)
             idx = random.choice(rng_idx, N, shape=(batch_size,), replace=False)
             f_all    = patches[idx]       # [B, L]
-            elev_all = elev_patches[idx]  # [B, L]
+            elev_all = elev_patches[idx] if use_elev else jnp.zeros_like(patches[idx])
             n_ctx = int(
                 random.randint(rng_ctx, shape=(), minval=N_CTX_MIN, maxval=N_CTX_MAX + 1)
             )
@@ -834,21 +835,24 @@ def eval_bsa_tnp(
     obs_mask: Array,
     true_f: Array,
     hdi_prob: float = 0.9,
+    use_elev: bool = True,
 ) -> tuple:
     """Run BSA-TNP direct prediction; return metrics + infer_time."""
     L = s.shape[0]
     ctx_idxs = jnp.where(obs_mask, size=obs_mask.sum())[0]
     n_ctx = ctx_idxs.shape[0]
     f_ctx_vals = true_f[ctx_idxs]
+    x_ctx_vals  = elev_patch[ctx_idxs] if use_elev else jnp.zeros(n_ctx)
+    x_test_vals = elev_patch            if use_elev else jnp.zeros(L)
     t0 = datetime.now()
     output = state.apply_fn(
         {"params": state.params, **state.kwargs},
-        x_ctx    = elev_patch[None, ctx_idxs, None],  # [1, n_ctx, 1]
+        x_ctx    = x_ctx_vals[None, :, None],          # [1, n_ctx, 1]
         s_ctx    = s[None, ctx_idxs],
         t_ctx    = jnp.zeros((1, n_ctx, 1)),
         f_ctx    = f_ctx_vals[None, :, None],
         mask_ctx = jnp.ones((1, n_ctx), dtype=bool),
-        x_test   = elev_patch[None, :, None],          # [1, L, 1]
+        x_test   = x_test_vals[None, :, None],          # [1, L, 1]
         s_test   = s[None],
         t_test   = jnp.zeros((1, L, 1)),
         training = False,
@@ -1030,6 +1034,38 @@ def main(seed: int = 42, use_wandb: bool = False):
         print(f"  BSA-TNP trained in {bsa_train_time:.0f}s  |  valid NLL: {bsa_nll:.4f}")
 
     # ------------------------------------------------------------------
+    # Train BSA-TNP (no elevation) — ablation baseline
+    # ------------------------------------------------------------------
+    bsa_ne_model = make_bsa_tnp()
+    bsa_ne_dir   = (save_dir / "BSA-TNP_no_elev").resolve()
+    bsa_ne_dir.mkdir(parents=True, exist_ok=True)
+    bsa_ne_ckpt  = bsa_ne_dir / "model.ckpt"
+
+    bsa_ne_lr = cosine_annealing_lr(BSA_TRAIN_STEPS, 5e-4)
+    bsa_ne_optimizer = optax.chain(
+        optax.clip_by_global_norm(0.5),
+        optax.adamw(bsa_ne_lr, b1=0.9, b2=0.999, weight_decay=1e-4),
+    )
+
+    if bsa_ne_ckpt.exists():
+        print("  [BSA-TNP (no elev)] checkpoint found, reloading.")
+        bsa_ne_state = reload_bsa_state(bsa_ne_ckpt, bsa_ne_model, s, bsa_ne_optimizer)
+    else:
+        print("\n=== Training BSA-TNP (no elev) ===")
+        rng, rng_net, rng_nev = random.split(rng, 3)
+        bsa_ne_train_loader = gen_bsa_dataloader(
+            jnp.array(train_patches), jnp.array(train_elev), s, use_elev=False
+        )
+        bsa_ne_valid_loader = gen_bsa_dataloader(
+            jnp.array(valid_patches), jnp.array(valid_elev), s, use_elev=False
+        )
+        bsa_ne_train_time, bsa_ne_nll, bsa_ne_state = bsa_model_train(
+            rng_net, rng_nev, bsa_ne_train_loader, bsa_ne_valid_loader,
+            bsa_ne_model, bsa_ne_dir, bsa_ne_optimizer,
+        )
+        print(f"  BSA-TNP (no elev) trained in {bsa_ne_train_time:.0f}s  |  valid NLL: {bsa_ne_nll:.4f}")
+
+    # ------------------------------------------------------------------
     # Build eval decoders (one DeepRV, one FM per K)
     # ------------------------------------------------------------------
     state_drv, drv_model = trained_states["DeepRV + gMLP"]
@@ -1051,7 +1087,7 @@ def main(seed: int = 42, use_wandb: bool = False):
             generate_surrogate_decoder(state_fm, fm_k), fm_inpaint
         )
 
-    eval_model_names = ["BSA-TNP", "SVGP"] + list(surrogate_decoders.keys())
+    eval_model_names = ["BSA-TNP", "BSA-TNP (no elev)", "SVGP"] + list(surrogate_decoders.keys())
 
     # ------------------------------------------------------------------
     # HMC inpainting on N_TEST test patches
@@ -1062,7 +1098,18 @@ def main(seed: int = 42, use_wandb: bool = False):
     )
     test_imgs = test_patches[test_idxs]
 
-    results = []
+    # Load any results already written by a previous run so we can skip
+    # re-evaluating models that are already in the CSV.
+    results_csv = save_dir / "results.csv"
+    if results_csv.exists():
+        existing_df = pd.read_csv(results_csv)
+        results = existing_df.to_dict("records")
+        done_keys = set(zip(existing_df["model_name"], existing_df["patch_idx"].astype(int)))
+        print(f"  Loaded {len(results)} existing rows from results.csv")
+    else:
+        results = []
+        done_keys = set()
+
     vis_true, vis_masked, vis_recons, vis_masks = [], [], [], []
 
     test_elevs = test_elev[test_idxs]
@@ -1085,50 +1132,81 @@ def main(seed: int = 42, use_wandb: bool = False):
         img_recons = []
 
         # --- BSA-TNP: direct prediction (no HMC) ---
-        rng, rng_bsa = random.split(rng)
-        (bsa_f_pred, bsa_f_std, bsa_rmse_ctx, bsa_rmse_target, bsa_rmse_all,
-         bsa_mae, bsa_crps, bsa_cov, bsa_nll, bsa_time) = (
-            eval_bsa_tnp(rng_bsa, bsa_state, s, elev_patch, obs_mask, true_f)
-        )
-        results.append({
-            "model_name": "BSA-TNP",
-            "patch_idx": int(patch_i),
-            "n_ctx": n_ctx,
-            "infer_time": bsa_time,
-            "RMSE (all)": bsa_rmse_all,
-            "RMSE (ctx)": bsa_rmse_ctx,
-            "RMSE (target)": bsa_rmse_target,
-            "MAE (target)": bsa_mae,
-            "CRPS (target)": bsa_crps,
-            "Coverage 90%": bsa_cov,
-            "NLL (target)": bsa_nll,
-            "mean ESS z": float("nan"),
-            "mean r_hat z": float("nan"),
-        })
-        img_recons.append(jnp.array(bsa_f_pred))
+        if ("BSA-TNP", patch_i) not in done_keys:
+            rng, rng_bsa = random.split(rng)
+            (bsa_f_pred, bsa_f_std, bsa_rmse_ctx, bsa_rmse_target, bsa_rmse_all,
+             bsa_mae, bsa_crps, bsa_cov, bsa_nll, bsa_time) = (
+                eval_bsa_tnp(rng_bsa, bsa_state, s, elev_patch, obs_mask, true_f)
+            )
+            results.append({
+                "model_name": "BSA-TNP",
+                "patch_idx": int(patch_i),
+                "n_ctx": n_ctx,
+                "infer_time": bsa_time,
+                "RMSE (all)": bsa_rmse_all,
+                "RMSE (ctx)": bsa_rmse_ctx,
+                "RMSE (target)": bsa_rmse_target,
+                "MAE (target)": bsa_mae,
+                "CRPS (target)": bsa_crps,
+                "Coverage 90%": bsa_cov,
+                "NLL (target)": bsa_nll,
+                "mean ESS z": float("nan"),
+                "mean r_hat z": float("nan"),
+            })
+            img_recons.append(jnp.array(bsa_f_pred))
+        else:
+            print(f"  [BSA-TNP | patch {patch_i}] cached, skipping.")
+
+        # --- BSA-TNP (no elev): same model trained/evaluated without elevation ---
+        if ("BSA-TNP (no elev)", patch_i) not in done_keys:
+            rng, rng_bsa_ne = random.split(rng)
+            (bsa_ne_f_pred, _, bsa_ne_rmse_ctx, bsa_ne_rmse_target, bsa_ne_rmse_all,
+             bsa_ne_mae, bsa_ne_crps, bsa_ne_cov, bsa_ne_nll, bsa_ne_time) = (
+                eval_bsa_tnp(rng_bsa_ne, bsa_ne_state, s, elev_patch, obs_mask, true_f, use_elev=False)
+            )
+            results.append({
+                "model_name": "BSA-TNP (no elev)",
+                "patch_idx": int(patch_i),
+                "n_ctx": n_ctx,
+                "infer_time": bsa_ne_time,
+                "RMSE (all)": bsa_ne_rmse_all,
+                "RMSE (ctx)": bsa_ne_rmse_ctx,
+                "RMSE (target)": bsa_ne_rmse_target,
+                "MAE (target)": bsa_ne_mae,
+                "CRPS (target)": bsa_ne_crps,
+                "Coverage 90%": bsa_ne_cov,
+                "NLL (target)": bsa_ne_nll,
+                "mean ESS z": float("nan"),
+                "mean r_hat z": float("nan"),
+            })
+        else:
+            print(f"  [BSA-TNP (no elev) | patch {patch_i}] cached, skipping.")
 
         # --- SVGP: fit per task, predict everywhere ---
-        rng, rng_svgp = random.split(rng)
-        (svgp_mu, svgp_std, svgp_rmse_ctx, svgp_rmse_target, svgp_rmse_all,
-         svgp_mae, svgp_crps, svgp_cov, svgp_nll, svgp_time) = eval_svgp(
-            rng_svgp, s, elev_patch, obs_mask, true_f, y_obs
-        )
-        results.append({
-            "model_name": "SVGP",
-            "patch_idx": int(patch_i),
-            "n_ctx": n_ctx,
-            "infer_time": svgp_time,
-            "RMSE (all)": svgp_rmse_all,
-            "RMSE (ctx)": svgp_rmse_ctx,
-            "RMSE (target)": svgp_rmse_target,
-            "MAE (target)": svgp_mae,
-            "CRPS (target)": svgp_crps,
-            "Coverage 90%": svgp_cov,
-            "NLL (target)": svgp_nll,
-            "mean ESS z": float("nan"),
-            "mean r_hat z": float("nan"),
-        })
-        img_recons.append(jnp.array(svgp_mu))
+        if ("SVGP", patch_i) not in done_keys:
+            rng, rng_svgp = random.split(rng)
+            (svgp_mu, svgp_std, svgp_rmse_ctx, svgp_rmse_target, svgp_rmse_all,
+             svgp_mae, svgp_crps, svgp_cov, svgp_nll, svgp_time) = eval_svgp(
+                rng_svgp, s, elev_patch, obs_mask, true_f, y_obs
+            )
+            results.append({
+                "model_name": "SVGP",
+                "patch_idx": int(patch_i),
+                "n_ctx": n_ctx,
+                "infer_time": svgp_time,
+                "RMSE (all)": svgp_rmse_all,
+                "RMSE (ctx)": svgp_rmse_ctx,
+                "RMSE (target)": svgp_rmse_target,
+                "MAE (target)": svgp_mae,
+                "CRPS (target)": svgp_crps,
+                "Coverage 90%": svgp_cov,
+                "NLL (target)": svgp_nll,
+                "mean ESS z": float("nan"),
+                "mean r_hat z": float("nan"),
+            })
+            img_recons.append(jnp.array(svgp_mu))
+        else:
+            print(f"  [SVGP | patch {patch_i}] cached, skipping.")
 
         for model_name, (decoder, hmc_model) in surrogate_decoders.items():
             safe_key = (
