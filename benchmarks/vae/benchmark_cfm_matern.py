@@ -598,6 +598,6 @@ if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
     p.add_argument("--seed",  type=int, default=42)
-    p.add_argument("--ls",    type=int, default=10)
+    p.add_argument("--ls",    type=int, default=20)
     args = p.parse_args()
     main(seed=args.seed, gt_ls=args.ls)
