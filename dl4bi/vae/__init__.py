@@ -7,6 +7,7 @@ from .deep_rv import (
     KernelBiasTransformerDeepRV,
 )
 from .flow_matching import FlowMatchingDeepRV, FlowMatchingVectorField
+from .conditional_flow_matching import ConditionalFMDeepRV, ConditionalVectorField, ContextEncoder
 from .pi_vae import Phi, PiVAE
 from .prior_cvae import PriorCVAE
 from .sp_vae import SPVAE
